@@ -15,8 +15,11 @@
 #include "http/StateFlags.h"
 #include "sbuf/SBuf.h"
 
+#include <vector>
+
 class FwdState;
 class HttpHeader;
+class String;
 
 class HttpStateData : public Client
 {
@@ -68,6 +71,9 @@ public:
     SBuf inBuf;                ///< I/O buffer for receiving server responses
     bool ignoreCacheControl;
     bool surrogateNoStore;
+
+    /// Upgrade header value sent to the origin server or cache peer.
+    String *upgradeHeaderOut = nullptr;
 
     void processSurrogateControl(HttpReply *);
 
@@ -135,8 +141,20 @@ private:
     void httpTimeout(const CommTimeoutCbParams &params);
 
     mb_size_t buildRequestPrefix(MemBuf * mb);
+
+    /// Runs the required acl checks and adds the Upgrade related
+    /// headers to outgoing headers.
+    void makeUpgradeHeaders(HttpHeader &);
     static bool decideIfWeDoRanges (HttpRequest * orig_request);
     bool peerSupportsConnectionPinning() const;
+
+    /// Process an "101 Switching Protocols" reply.
+    /// \return true if and only if we are going to switch the protocols
+    bool processSwitchingProtocols(const HttpReply *);
+
+    /// Check if all of the protocols listed in the reply Upgrade header
+    /// included in the HTTP request Upgrade header.
+    bool upgradeProtocolsSupported(const HttpReply *) const;
 
     /// Parser being used at present to parse the HTTP/ICY server response.
     Http1::ResponseParserPointer hp;

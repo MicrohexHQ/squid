@@ -36,8 +36,8 @@ strListAdd(String * str, const char *item, char del)
 int
 strListIsMember(const String * list, const SBuf &m, char del)
 {
-    const char *pos = NULL;
-    const char *item;
+    const char *pos = nullptr;
+    const char *item = nullptr;
     int ilen = 0;
 
     assert(list);
@@ -47,6 +47,21 @@ strListIsMember(const String * list, const SBuf &m, char del)
             return 1;
     }
     return 0;
+}
+
+bool
+strListIsMember_if(const String *list, const char del, const MemberFilter filter)
+{
+    const char *pos = NULL;
+    const char *item;
+    int ilen = 0;
+    assert(list);
+
+    while (strListGetItem(list, del, &item, &ilen, &pos)) {
+        if (filter(item, ilen))
+            return true;
+    }
+    return false;
 }
 
 /** returns true iff "s" is a substring of a member of the list */

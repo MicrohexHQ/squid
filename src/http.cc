@@ -51,6 +51,7 @@
 #include "refresh.h"
 #include "RefreshPattern.h"
 #include "rfc1738.h"
+#include "sbuf/StringConvert.h"
 #include "SquidConfig.h"
 #include "SquidTime.h"
 #include "StatCounters.h"
@@ -136,6 +137,8 @@ HttpStateData::~HttpStateData()
         delete httpChunkDecoder;
 
     cbdataReferenceDone(_peer);
+
+    delete upgradeHeaderOut;
 
     debugs(11,5, HERE << "HttpStateData " << this << " destroyed; " << serverConnection);
 }
@@ -819,6 +822,15 @@ HttpStateData::handle1xx(HttpReply *reply)
     }
 #endif // USE_HTTP_VIOLATIONS
 
+    if (reply->sline.status() == Http::scSwitchingProtocols) {
+        if (!processSwitchingProtocols(reply)) {
+            auto err = new ErrorState(ERR_INVALID_RESP, Http::scBadGateway, request.getRaw(), fwd->al);
+            fwd->fail(err);
+            closeServer();
+            return;
+        }
+    }
+
     debugs(11, 2, HERE << "forwarding 1xx to client");
 
     // the Sink will use this to call us back after writing 1xx to the client
@@ -833,11 +845,99 @@ HttpStateData::handle1xx(HttpReply *reply)
     // for similar reasons without a 1xx response.
 }
 
+bool
+HttpStateData::upgradeProtocolsSupported(const HttpReply *reply) const
+{
+    const auto upgradeProtos = reply->header.getList(Http::HdrType::UPGRADE);
+
+    if (!upgradeHeaderOut) {
+        debugs(11, 2, "Upgrade to '" << upgradeProtos << "' is not requested");
+        return false;
+    }
+
+    const char *pos = nullptr;
+    const char *item = nullptr;
+    int ilen = 0;
+    while (strListGetItem(&upgradeProtos, ',', &item, &ilen, &pos)) {
+        const auto e = std::find(item, item + ilen, '/');
+        ilen = e - item; //Fix ilen to not include protocol version
+        bool found = strListIsMember_if(upgradeHeaderOut, ',',
+                                        [item, ilen](const char *check, int checkLen) {
+                                            const auto chkE = std::find(check, check + checkLen, '/');
+                                            checkLen = chkE - check; // base protocol name length
+                                            return (ilen == checkLen && strncasecmp(item, check, checkLen) == 0);
+                                        });
+        if (!found) {
+            debugs(11, 2, "Upgrade to " << SBuf(item, ilen)<< " is not requested by client or not allowed by squid configuration");
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool
+HttpStateData::processSwitchingProtocols(const HttpReply *reply)
+{
+    // Must have an upgrade header
+    if (!reply->header.has(Http::HdrType::UPGRADE))
+        return false;
+
+    // Must include a "Connection: upgrade" header (RFC 7230 section 6.7)
+    if (!reply->header.hasListMember(Http::HdrType::CONNECTION, "upgrade", ','))
+        return false;
+
+    if (!upgradeProtocolsSupported(reply))
+        return false;
+
+    flags.handling101 = true;
+    return true;
+}
+
+/// Dialer to pass the control of the server Comm::Connection object to the
+/// related ConnStateData object. The HttpStateData has remove any reference
+/// to the server connection before pass the control to ConnStateData so this
+/// dialer has to close the connection if the recipient does not exist any more.
+class ServerConnectionControlDialer: public UnaryMemFunT<ConnStateData, ConnStateData::ServerConnectionContext>
+{
+public:
+    typedef UnaryMemFunT<ConnStateData, ConnStateData::ServerConnectionContext> Parent;
+
+    ServerConnectionControlDialer(const CbcPointer<ConnStateData> &mgr, const ConnStateData::ServerConnectionContext &scc): Parent(mgr, &ConnStateData::noteTakeServerConnectionControl, scc) {}
+
+    virtual bool canDial(AsyncCall &call) override {
+        if (!Parent::canDial(call)) {
+            debugs(11, 2, "ConnStateData gone, close server connection to avoid orphan connection!");
+            arg1.connection->close();
+            return false;
+        }
+        return true;
+    }
+
+    const char *callName = "ConnStateData::noteTakeServerConnectionControl";
+};
+
 /// restores state and resumes processing after 1xx is ignored or forwarded
 void
 HttpStateData::proceedAfter1xx()
 {
     Must(flags.handling1xx);
+    if (flags.handling101) {
+        // Our job is finished here. The control passed to other
+        // squid subsystems.
+        ConnStateData::ServerConnectionContext scc(serverConnection, request);
+        ServerConnectionControlDialer dialer(request->clientConnectionManager, scc);
+        AsyncCall::Pointer call = asyncCall(11, 3, dialer.callName, dialer);
+        ScheduleCallHere(call);
+        fwd->unregister(serverConnection);
+        comm_remove_close_handler(serverConnection->fd, closeHandler);
+        closeHandler = nullptr;
+        serverConnection = nullptr;
+        doneWithFwd = "SwitchingProtocol";
+        mustStop("SwitchingProtocol");
+        return;
+    }
+
     debugs(11, 2, "continuing with " << payloadSeen << " bytes in buffer after 1xx");
     CallJobHere(11, 3, this, HttpStateData, HttpStateData::processReply);
 }
@@ -1953,6 +2053,91 @@ HttpStateData::httpBuildRequestHeader(HttpRequest * request,
     strConnection.clean();
 }
 
+/// A protocol-comparing predicate for STL search algorithms.
+/// Helps to match a versioned reference protocol name to a
+/// name without version (for example the reference 'websocket/1.2'
+/// should match to 'websocket').
+class MatchProtocol
+{
+public:
+    explicit MatchProtocol(const char *s, size_t len) : reference(s), referenceLen(len) {
+        const char *end = std::find(reference, reference + referenceLen, '/');
+        referenceBaseLen = end - reference;
+    }
+
+    /// Operator to search in lists or vectors
+    bool operator() (const SBuf &checking) {
+        if (referenceIsVersioned()) {
+            const bool checkingIsVersioned = (checking.find('/') != SBuf::npos);
+            if (!checkingIsVersioned) {
+                return checking.length() == referenceBaseLen && checking.caseCmp(reference, referenceBaseLen) == 0;
+            }
+        }
+        return checking.length() == referenceLen && checking.caseCmp(reference, referenceLen) == 0;
+    }
+
+    /// Operator to search in std::maps or similar
+    template<typename T>
+    bool operator() (const std::pair<const SBuf, T> &checkingPair) {
+        return (*this)(checkingPair.first);
+    }
+
+private:
+    /// \return true if the reference protocol includes version info
+    bool referenceIsVersioned() { return (referenceBaseLen != referenceLen); }
+
+    const char *reference; ///< The reference protocol
+
+    /// The full length of reference protocol string, including the
+    /// version part
+    size_t referenceLen;
+
+    /// The length of reference protocol string without version part
+    size_t referenceBaseLen;
+};
+
+void
+HttpStateData::makeUpgradeHeaders(HttpHeader &hdr_out)
+{
+    const HttpHeader &hdr_in = request->header;
+
+    if (!hdr_in.has(Http::HdrType::UPGRADE))
+        return;
+
+    if (!Config.http_upgrade_protocols)
+        return;
+
+    const auto upgradeIn = hdr_in.getList(Http::HdrType::UPGRADE);
+    String upgradeOut;
+    const char *pos = nullptr;
+    const char *item = nullptr;
+    int ilen = 0;
+    while (strListGetItem(&upgradeIn, ',', &item, &ilen, &pos)) {
+        auto it = std::find_if(Config.http_upgrade_protocols->begin(), Config.http_upgrade_protocols->end(), MatchProtocol(item, ilen));
+
+        // If protocol not found try the "OTHER" protocol
+        if (it == Config.http_upgrade_protocols->end()) {
+            static const SBuf other("OTHER");
+            it = Config.http_upgrade_protocols->find(other);
+        }
+
+        if (it != Config.http_upgrade_protocols->end() && it->second != nullptr) {
+            const acl_access *acl = it->second;
+            ACLFilledChecklist ch(acl, request.getRaw());
+            ch.al = fwd->al;
+            if (ch.fastCheck().allowed()) {
+                SBuf proto(item, ilen);
+                strListAdd(&upgradeOut, proto.c_str(), ',');
+            }
+        }
+    }
+
+    if (upgradeOut.size()) {
+        hdr_out.putStr(Http::HdrType::UPGRADE, upgradeOut.termedBuf());
+        hdr_out.putStr(Http::HdrType::CONNECTION, "Upgrade");
+    }
+}
+
 /**
  * Decides whether a particular header may be cloned from the received Clients request
  * to our outgoing fetch request.
@@ -2182,12 +2367,18 @@ HttpStateData::buildRequestPrefix(MemBuf * mb)
     /* build and pack headers */
     {
         HttpHeader hdr(hoRequest);
+        makeUpgradeHeaders(hdr);
         httpBuildRequestHeader(request.getRaw(), entry, fwd->al, &hdr, flags);
 
         if (request->flags.pinned && request->flags.connectionAuth)
             request->flags.authSent = true;
         else if (hdr.has(Http::HdrType::AUTHORIZATION))
             request->flags.authSent = true;
+
+        if (hdr.has(Http::HdrType::UPGRADE)) {
+            assert(!upgradeHeaderOut);
+            upgradeHeaderOut = new String(hdr.getList(Http::HdrType::UPGRADE));
+        }
 
         hdr.packInto(mb);
         hdr.clean();

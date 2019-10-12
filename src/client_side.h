@@ -76,6 +76,15 @@ class ConnStateData : public Server, public HttpControlMsgSink, private Independ
 {
 
 public:
+    /// Used to send us squid-to-server connection details
+    /// through noteTakeServerConnectionControl callback
+    class ServerConnectionContext {
+    public:
+        ServerConnectionContext(Comm::ConnectionPointer &conn, HttpRequest::Pointer &req): connection(conn), request(req) {}
+        Comm::ConnectionPointer connection; ///< to-server connection to be pinned
+        HttpRequest::Pointer request; ///< to-server request that initiated serverConnection
+    };
+
     explicit ConnStateData(const MasterXactionPointer &xact);
     virtual ~ConnStateData();
 
@@ -198,6 +207,11 @@ public:
 
     // pining related comm callbacks
     virtual void clientPinnedConnectionClosed(const CommCloseCbParams &io);
+
+    /// Give us the control of squid-to-server connection
+    /// It is used for example to initiate a tunnel between client and server
+    /// connections after switching to a new protocol.
+    virtual void noteTakeServerConnectionControl(ServerConnectionContext scc) {}
 
     // comm callbacks
     void clientReadFtpData(const CommIoCbParams &io);
@@ -470,6 +484,7 @@ void clientProcessRequest(ConnStateData *, const Http1::RequestParserPointer &, 
 void clientPostHttpsAccept(ConnStateData *);
 
 std::ostream &operator <<(std::ostream &os, const ConnStateData::PinnedIdleContext &pic);
+std::ostream &operator <<(std::ostream &os, const ConnStateData::ServerConnectionContext &scc);
 
 #endif /* SQUID_CLIENTSIDE_H */
 

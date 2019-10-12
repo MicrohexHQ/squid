@@ -33,7 +33,9 @@ protected:
     virtual void processParsedRequest(Http::StreamPointer &context);
     virtual void handleReply(HttpReply *rep, StoreIOBuffer receivedData);
     virtual bool writeControlMsgAndCall(HttpReply *rep, AsyncCall::Pointer &call);
+    virtual int pipelinePrefetchMax() const;
     virtual time_t idleTimeout() const;
+    virtual void noteTakeServerConnectionControl(ServerConnectionContext scc);
 
     /* BodyPipe API */
     virtual void noteMoreBodySpaceAvailable(BodyPipe::Pointer);
@@ -58,6 +60,9 @@ private:
 
     Http1::RequestParserPointer parser_;
     HttpRequestMethod method_; ///< parsed HTTP method
+
+    /// true if the last client HTTP request wants to upgrade
+    bool mayUpgrade = false;
 
     /// temporary hack to avoid creating a true HttpsServer class
     const bool isHttpsServer;

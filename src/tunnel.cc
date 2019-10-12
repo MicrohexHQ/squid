@@ -1224,9 +1224,16 @@ TunnelStateData::notifyConnOpener()
     }
 }
 
-#if USE_OPENSSL
+/**
+ * Establish a tunnel between a client and a server connections and
+ * starts transferring traffic.
+ * \param request The related HttpRequest object
+ * \param clientConn the client side connection.
+ * \param srvConn the server side connection
+ * \param serverPayload pre-read data from server side connection
+ */
 void
-switchToTunnel(HttpRequest *request, Comm::ConnectionPointer &clientConn, Comm::ConnectionPointer &srvConn)
+switchToTunnel(HttpRequest *request, Comm::ConnectionPointer &clientConn, Comm::ConnectionPointer &srvConn, const SBuf *serverPayload)
 {
     debugs(26,5, "Revert to tunnel FD " << clientConn->fd << " with FD " << srvConn->fd);
 
@@ -1242,9 +1249,6 @@ switchToTunnel(HttpRequest *request, Comm::ConnectionPointer &clientConn, Comm::
     debugs(26, 3, request->method << " " << context->http->uri << " " << request->http_ver);
 
     TunnelStateData *tunnelState = new TunnelStateData(context->http);
-
-    // tunnelStartShoveling() drains any buffered from-client data (inBuf)
-    fd_table[clientConn->fd].useDefaultIo();
 
     request->hier.resetPeerNotes(srvConn, tunnelState->getHost());
 
@@ -1269,15 +1273,9 @@ switchToTunnel(HttpRequest *request, Comm::ConnectionPointer &clientConn, Comm::
                                      CommTimeoutCbPtrFun(tunnelTimeout, tunnelState));
     commSetConnTimeout(srvConn, Config.Timeout.read, timeoutCall);
 
-    // we drain any already buffered from-server data below (rBufData)
-    fd_table[srvConn->fd].useDefaultIo();
+    if (serverPayload)
+        tunnelState->preReadServerData = *serverPayload;
 
-    auto ssl = fd_table[srvConn->fd].ssl.get();
-    assert(ssl);
-    BIO *b = SSL_get_rbio(ssl);
-    Ssl::ServerBio *srvBio = static_cast<Ssl::ServerBio *>(BIO_get_data(b));
-    tunnelState->preReadServerData = srvBio->rBufData();
     tunnelStartShoveling(tunnelState);
 }
-#endif //USE_OPENSSL
 

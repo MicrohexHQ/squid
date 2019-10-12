@@ -233,6 +233,15 @@ Http::One::Server::proceedAfterBodyContinuation(Http::StreamPointer context)
     clientProcessRequest(this, parser_, context.getRaw());
 }
 
+int
+Http::One::Server::pipelinePrefetchMax() const
+{
+    if (mayUpgrade)
+        return 0;
+
+    return ConnStateData::pipelinePrefetchMax();
+}
+
 void
 Http::One::Server::processParsedRequest(Http::StreamPointer &context)
 {
@@ -241,6 +250,8 @@ Http::One::Server::processParsedRequest(Http::StreamPointer &context)
 
     ClientHttpRequest *http = context->http;
     HttpRequest::Pointer request = http->request;
+
+    mayUpgrade = request->header.has(Http::HdrType::UPGRADE);
 
     if (request->header.has(Http::HdrType::EXPECT)) {
         const String expect = request->header.getList(Http::HdrType::EXPECT);
@@ -335,12 +346,23 @@ Http::One::Server::writeControlMsgAndCall(HttpReply *rep, AsyncCall::Pointer &ca
 
     const ClientHttpRequest *http = context->http;
 
+    String upgradeHeader;
+    const bool switching = (rep->sline.status() == Http::scSwitchingProtocols);
+    if (switching) // save Upgrade header
+        upgradeHeader = rep->header.getList(Http::HdrType::UPGRADE);
+
     // apply selected clientReplyContext::buildReplyHeader() mods
     // it is not clear what headers are required for control messages
     rep->header.removeHopByHopEntries();
     // paranoid: ContentLengthInterpreter has cleaned non-generated replies
     rep->removeIrrelevantContentLength();
-    rep->header.putStr(Http::HdrType::CONNECTION, "keep-alive");
+
+    if (switching) {
+        rep->header.putStr(Http::HdrType::UPGRADE, upgradeHeader.termedBuf());
+        rep->header.putStr(Http::HdrType::CONNECTION, "Upgrade");
+    } else
+        rep->header.putStr(Http::HdrType::CONNECTION, "keep-alive");
+
     httpHdrMangleList(&rep->header, http->request, http->al, ROR_REPLY);
 
     MemBuf *mb = rep->pack();
@@ -352,6 +374,21 @@ Http::One::Server::writeControlMsgAndCall(HttpReply *rep, AsyncCall::Pointer &ca
 
     delete mb;
     return true;
+}
+
+void
+switchToTunnel(HttpRequest *request, Comm::ConnectionPointer &clientConn, Comm::ConnectionPointer &srvConn, const SBuf *serverPayload);
+
+void
+Http::One::Server::noteTakeServerConnectionControl(ServerConnectionContext scc)
+{
+    Comm::ConnectionPointer serverConnection = scc.connection;
+    const auto context = pipeline.front();
+    assert(context != nullptr);
+    const auto http = context->http;
+    assert(http->request == scc.request.getRaw());
+    stopReading(); // Stop reading for more requests, tunnel code starts now
+    switchToTunnel(scc.request.getRaw(), clientConnection, serverConnection, nullptr);
 }
 
 ConnStateData *

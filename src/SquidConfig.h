@@ -31,6 +31,8 @@
 #include "store/Disk.h"
 #include "store/forward.h"
 
+#include <map>
+
 #if USE_OPENSSL
 class sslproxy_cert_sign;
 class sslproxy_cert_adapt;
@@ -47,6 +49,8 @@ class external_acl;
 class HeaderManglers;
 class RefreshPattern;
 class RemovalPolicySettings;
+// maps HTTP Upgrade protocol name/version to the access list guarding its usage
+typedef  std::map<SBuf, acl_access *> HttpUpgradeProtocolAccess;
 
 namespace AnyP
 {
@@ -474,6 +478,8 @@ public:
     HeaderWithAclList *request_header_add;
     ///reply_header_add access list
     HeaderWithAclList *reply_header_add;
+    ///http_upgrade_request_protocols access list
+    HttpUpgradeProtocolAccess *http_upgrade_protocols;
     ///note
     Notes notes;
     char *coredump_dir;
